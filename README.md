@@ -2,6 +2,8 @@
 
 **Development release.** The installer build is automated, but no Windows setup EXE has been built or end-to-end tested in this environment. The `.zip` is source plus Windows installer build tooling, not a compiled installer.
 
+**Created with AI**
+
 ## Features
 
 - Mount MEGA storage in Windows Explorer at a selectable free drive letter (`M:`, `N:`, etc.) with rclone + WinFsp.
