@@ -22,7 +22,7 @@ class OwnershipTests(unittest.TestCase):
         proc = MagicMock()
         proc.poll.return_value = None
         eng.proc = proc
-        with patch.object(eng, 'rc', return_value={'queue':[{'name':'a'}]}):
+        with patch.object(eng, 'transfer_snapshot', return_value={'queue':[{'name':'a'}], 'cache': {'uploadsQueued':1, 'uploadsInProgress':0, 'erroredFiles':0, 'outOfSpace':False}, 'stats':{'transferring':[]}}):
             with self.assertRaisesRegex(RuntimeError, 'pending'):
                 eng.stop()
         proc.terminate.assert_not_called()
@@ -42,7 +42,7 @@ class OwnershipTests(unittest.TestCase):
         proc = MagicMock()
         proc.poll.return_value = None
         eng.proc = proc
-        with patch.object(eng, 'rc', return_value={'queue':[]}):
+        with patch.object(eng, 'transfer_snapshot', return_value={'queue':[], 'cache': {'uploadsQueued':0, 'uploadsInProgress':0, 'erroredFiles':0, 'outOfSpace':False}, 'stats':{'transferring':[]}}), patch.object(eng, '_verify_observed_remote'), patch('nimbomount.core.time.sleep'):
             eng.stop()
         proc.terminate.assert_called_once()
         proc.wait.assert_called_once()

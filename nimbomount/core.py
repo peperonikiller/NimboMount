@@ -323,6 +323,7 @@ class MountEngine:
                 self._log_thread = threading.Thread(target=self._capture_errors, args=(proc,), daemon=True)
                 self._log_thread.start()
                 self.point = mountpoint
+                self._observed_writes = {}
                 self.last_error = ""
             except Exception:
                 self._delete_config()
@@ -394,50 +395,154 @@ class MountEngine:
         except (subprocess.TimeoutExpired, OSError) as exc:
             return False, f"MEGA unreachable: {type(exc).__name__}"
 
-    def rc(self, command: str) -> dict:
+    def rc(self, command: str, params: dict | None = None) -> dict:
         """Query this mount's authenticated, loopback-only rclone RC endpoint."""
         with self._lock:
             if not self.alive() or not self.rc_port or not self.rc_secret:
                 raise RuntimeError("Mount is not active")
             port, user, secret = self.rc_port, self.rc_user, self.rc_secret
         req = urllib.request.Request(f"http://127.0.0.1:{port}/{command}",
-                                     data=b"{}", headers={
+                                     data=json.dumps(params or {}).encode("utf-8"), headers={
                                          "Content-Type": "application/json",
                                          "Authorization": "Basic " + base64.b64encode(f"{user}:{secret}".encode()).decode()})
         with urllib.request.urlopen(req, timeout=4) as reply:
             return json.load(reply)
 
     def transfer_snapshot(self) -> dict:
-        """Live queue and bytes from rclone. No inference that missing == confirmed uploaded."""
-        queue = self.rc("vfs/queue").get("queue", [])
-        vfs = self.rc("vfs/stats").get("diskCache", {})
+        """Read all VFS durability counters; never default a missing counter to zero."""
+        queue_payload = self.rc("vfs/queue")
+        vfs_payload = self.rc("vfs/stats")
         stats = self.rc("core/stats")
-        return {"queue": queue, "cache": vfs, "stats": stats,
-                "collected": time.time()}
+        queue = queue_payload.get("queue")
+        cache = vfs_payload.get("diskCache")
+        if not isinstance(queue, list) or not isinstance(cache, dict):
+            raise RuntimeError("rclone did not return VFS queue and disk-cache statistics")
+        required = ("uploadsQueued", "uploadsInProgress", "erroredFiles", "outOfSpace")
+        if any(key not in cache for key in required):
+            raise RuntimeError("rclone did not return all required write safety counters")
+        with self._lock:
+            # Track every queued item seen during this mount. On completion it must
+            # also exist on the remote with the same size before we consider it verified.
+            if not hasattr(self, "_observed_writes"):
+                self._observed_writes = {}
+            for item in queue:
+                name = item.get("name")
+                size = item.get("size")
+                if isinstance(name, str) and name and isinstance(size, int):
+                    self._observed_writes[name] = size
+        return {"queue": queue, "cache": cache, "stats": stats, "collected": time.time()}
+
+    @staticmethod
+    def _write_state(snapshot: dict) -> tuple[bool, str]:
+        """Fail closed for every unknown, busy or errored cache state."""
+        cache = snapshot.get("cache")
+        queue = snapshot.get("queue")
+        if not isinstance(cache, dict) or not isinstance(queue, list):
+            return False, "Upload queue or cache status is unavailable"
+        for key in ("uploadsQueued", "uploadsInProgress", "erroredFiles", "outOfSpace"):
+            if key not in cache:
+                return False, f"Missing rclone VFS counter: {key}"
+        if cache["outOfSpace"]:
+            return False, "VFS cache reports insufficient disk space"
+        if cache["erroredFiles"]:
+            return False, f"VFS cache reports {cache['erroredFiles']} errored file(s)"
+        if queue or cache["uploadsQueued"] or cache["uploadsInProgress"]:
+            return False, (f"Uploads pending: {len(queue)} visible, "
+                           f"{cache['uploadsQueued']} queued, {cache['uploadsInProgress']} active")
+        stats = snapshot.get("stats")
+        if not isinstance(stats, dict) or not isinstance(stats.get("transferring"), list):
+            return False, "Active-transfer statistics unavailable"
+        if stats["transferring"]:
+            return False, "Transfers are still active"
+        if stats.get("errors", 0):
+            return False, "rclone transfer statistics report errors"
+        return True, "VFS cache is idle and reports no pending or errored writes"
+
+    def retry_upload(self, item_id: int) -> None:
+        """Prioritize a real queued write; never rewrite/remove cache files."""
+        if isinstance(item_id, bool) or not isinstance(item_id, int):
+            raise ValueError("Select a valid upload")
+        queue = self.transfer_snapshot()["queue"]
+        item = next((x for x in queue if x.get("id") == item_id), None)
+        if item is None:
+            raise RuntimeError("Upload no longer exists in the queue; refresh transfers")
+        if item.get("uploading"):
+            raise RuntimeError("This file is already uploading")
+        self.rc("vfs/queue-set-expiry", {"id": item_id, "expiry": -1000000000})
+
+    def retry_all_queued(self) -> int:
+        """Move pending and retrying writes to the front of rclone's VFS queue."""
+        queue = self.transfer_snapshot()["queue"]
+        ids = [x["id"] for x in queue
+               if isinstance(x.get("id"), int) and not isinstance(x.get("id"), bool)
+               and not x.get("uploading")]
+        for item_id in ids:
+            self.rc("vfs/queue-set-expiry", {"id": item_id, "expiry": -1000000000})
+        return len(ids)
+
+    def refresh_cloud(self) -> None:
+        """Invalidate and reload the mounted root's directory cache."""
+        self.rc("vfs/refresh", {"dir": "", "recursive": False})
+
+    def set_bandwidth_limit(self, rate: str) -> dict:
+        """Set transfer speed on the owned mount, not globally on the computer."""
+        if rate not in ("off", "512k", "1M", "5M", "10M", "25M", "50M"):
+            raise ValueError("Unsupported speed limit")
+        return self.rc("core/bwlimit", {"rate": rate})
+
+    def _verify_observed_remote(self) -> None:
+        """Metadata confirmation of files observed in the live queue.
+
+        This is not a content hash or server durability guarantee. Files not seen
+        by the polling loop cannot be verified by this method.
+        """
+        with self._lock:
+            observed = dict(getattr(self, "_observed_writes", {}))
+        for name, expected_size in observed.items():
+            path = name.lstrip("/")
+            if path.startswith("../") or not path:
+                raise RuntimeError("Unsafe upload path found; refusing to unmount")
+            result = self.rc("operations/stat", {"fs": REMOTE + ":", "remote": path})
+            item = result.get("item")
+            if not isinstance(item, dict) or item.get("Size") != expected_size:
+                raise RuntimeError(f"Remote copy not confirmed for {name}; mount remains active")
+
+    def verify_writes_for_unmount(self, *, checks: int = 3, interval: float = 1.5) -> None:
+        """Require several consecutive clean snapshots and remote metadata checks.
+
+        Conservative, best-effort safety gate; not a proof of physical durability.
+        """
+        if checks < 2:
+            raise ValueError("At least two independent checks required")
+        for i in range(checks):
+            try:
+                snapshot = self.transfer_snapshot()
+            except Exception as exc:
+                raise RuntimeError("Cannot safely unmount: write state is unavailable; mount and cache retained") from exc
+            good, reason = self._write_state(snapshot)
+            if not good:
+                raise RuntimeError("Cannot safely unmount: " + reason + ". Mount and cache retained.")
+            if i < checks - 1:
+                time.sleep(interval)
+        self._verify_observed_remote()
+        # Race reduction: check state again after remote metadata requests.
+        good, reason = self._write_state(self.transfer_snapshot())
+        if not good:
+            raise RuntimeError("Unmount interrupted by new writes: " + reason)
 
     def pending_uploads(self) -> int:
-        """Fail closed: an unknown queue must not be treated as empty."""
-        payload = self.rc("vfs/queue")
-        queue = payload.get("queue")
-        if not isinstance(queue, list):
-            raise RuntimeError("Could not verify the pending upload queue. Leaving the mount running.")
-        return len(queue)
+        return len(self.transfer_snapshot()["queue"])
 
     def stop(self) -> None:
-        """Graceful exit, after verifying no pending VFS uploads. Never force kill."""
+        """Refuse normal unmount until cache is quiet and observed writes verified."""
         with self._lock:
             if self.proc and self.proc.poll() is None:
-                try:
-                    pending = self.pending_uploads()
-                except Exception as exc:
-                    raise RuntimeError("Cannot safely unmount: upload queue unavailable. The mount and cache remain active. " + str(exc)) from exc
-                if pending:
-                    raise RuntimeError(f"Cannot unmount: {pending} upload(s) are pending. Wait for uploads to finish; NimboMount remains running.")
+                self.verify_writes_for_unmount()
                 self.proc.terminate()
                 try:
                     self.proc.wait(timeout=15)
                 except subprocess.TimeoutExpired:
-                    raise RuntimeError("rclone is still shutting down. NimboMount will remain open; no force kill was attempted.")
+                    raise RuntimeError("rclone has not exited. Mount/cache retained; no force kill attempted.")
             self.proc = None
             self.point = ""
             self._delete_config()

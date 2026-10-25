@@ -56,6 +56,7 @@ class MainWindow(QMainWindow):
         self.events.result.connect(self._result)
         self.events.transfers.connect(self._transfers)
         self.queue_polling = False
+        self.queue_ids = []
         self.last_transfer_poll = 0
         self.busy = False
         self.failures = 0
@@ -214,6 +215,14 @@ class MainWindow(QMainWindow):
         self.queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.queue_table.setMinimumHeight(155)
         transfers_layout.addWidget(self.queue_table, 1)
+        retry_bar = QHBoxLayout()
+        self.retry_button = QPushButton("Retry selected upload now")
+        self.retry_button.setEnabled(False)
+        self.retry_button.clicked.connect(self.retry_selected_upload)
+        retry_bar.addWidget(self.retry_button)
+        self.queue_table.itemSelectionChanged.connect(self._retry_selection_changed)
+        retry_bar.addStretch(1)
+        transfers_layout.addLayout(retry_bar)
         self.transfer_summary = QLabel("Queue unavailable until mounted")
         self.transfer_summary.setWordWrap(True)
         transfers_layout.addWidget(self.transfer_summary)
@@ -457,6 +466,12 @@ class MainWindow(QMainWindow):
                 # Do not automatically retry authentication errors.
                 if self.reconnect.isChecked() and any(x in message.lower() for x in ("network", "unreachable", "timeout")):
                     self.next_retry = time.monotonic() + 15
+        elif op == "retry_upload":
+            if ok:
+                self.transfer_summary.setText("Retry requested. rclone will upload the selected queued file as soon as a slot is available.")
+                self.last_transfer_poll = 0
+            else:
+                QMessageBox.warning(self, APP, "Could not retry upload: " + message)
         elif op == "stop":
             if ok:
                 self.connected_once = False
@@ -583,6 +598,21 @@ class MainWindow(QMainWindow):
             self.force_login.setChecked(True)
             self.diagnostics_view.setPlainText("Saved session removed. Enter password and a fresh 2FA code.")
 
+    def _retry_selection_changed(self):
+        row = self.queue_table.currentRow()
+        self.retry_button.setEnabled(self.engine.alive() and not self.busy and
+                                     0 <= row < len(self.queue_ids) and self.queue_ids[row] is not None)
+
+    def retry_selected_upload(self):
+        row = self.queue_table.currentRow()
+        if not (0 <= row < len(self.queue_ids)):
+            return
+        item_id = self.queue_ids[row]
+        if item_id is None:
+            return
+        self.retry_button.setEnabled(False)
+        self._worker("retry_upload", lambda: self.engine.retry_upload(item_id))
+
     def _poll_transfers(self):
         try:
             data = self.engine.transfer_snapshot()
@@ -598,6 +628,7 @@ class MainWindow(QMainWindow):
         queue = data.get("queue") or []
         cache = data.get("cache") or {}
         stats = data.get("stats") or {}
+        self.queue_ids = [item.get("id") if isinstance(item.get("id"), int) else None for item in queue]
         self.queue_table.setRowCount(len(queue))
         # core/stats transfers names may reflect backend internal names, not exactly VFS path.
         running = stats.get("transferring") or []
@@ -613,6 +644,7 @@ class MainWindow(QMainWindow):
             cells = [name, self._human_bytes(entry.get("size", 0)), state, str(tries), pct]
             for j, value in enumerate(cells):
                 self.queue_table.setItem(i, j, QTableWidgetItem(value))
+        self._retry_selection_changed()
         errors = int(cache.get("erroredFiles") or 0)
         low_disk = bool(cache.get("outOfSpace"))
         self.transfer_summary.setText(
@@ -668,7 +700,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP, "A filesystem operation is in progress. Try exiting again shortly.")
             return
         if self.engine.alive():
-            answer = QMessageBox.question(self, APP, "Unmount MEGA and exit? Pending cached writes may need more time to upload.")
+            answer = QMessageBox.question(self, APP, "Verify pending writes and unmount? NimboMount will refuse to exit if any transfer or cache error remains.")
             if answer != QMessageBox.StandardButton.Yes:
                 return
             try:

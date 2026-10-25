@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 — rclone integration and safer writes
+
+- Safer normal-unmount gate combining VFS queue, cache status and transfer status across consecutive checks.
+- Remote metadata (name/size) verification of observed uploads; explicitly not an end-to-end durability guarantee.
+- Retry selected or all eligible uploads through rclone VFS queue controls.
+- Manual directory refresh and runtime bandwidth limiter.
+- Tests for retry operations, limit validation and safety-state failure.
+
 ## 0.7.1
 - Single-instance guard for the application.
 - Detection of existing NimboMount-owned rclone mounts.
