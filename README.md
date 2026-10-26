@@ -7,7 +7,7 @@
 
 NimboMount is an experimental, open-source-ready Python/Qt desktop application that uses [rclone](https://rclone.org/) to expose a MEGA cloud account as a mounted filesystem. The current release focuses on Windows drive letters through [WinFsp](https://winfsp.dev/); the Linux codebase is included, but Linux packaging is not a release target yet.
 
-**Current version:** `0.8.0` · **Status:** development / unverified end-to-end · **Release format:** source code and installer build scripts (not a compiled installer).
+**Current version:** `0.8.5` · **Status:** development / unverified end-to-end · **Release format:** source code and installer build scripts (not a compiled installer).
 
 ![NimboMount app icon](nimbomount/assets/app.png)
 
@@ -20,7 +20,7 @@ NimboMount is an experimental, open-source-ready Python/Qt desktop application t
 - **Transfer view:** VFS queue, upload progress when available, cached-write status, retry attempts, cache errors, and diagnostics.
 - **Retry controls:** prioritize an individual or all eligible queued uploads through rclone's supported VFS queue controls. These controls cannot resurrect files that are no longer present in rclone's queue.
 - **Conservative unmount gate:** refuses a normal unmount if queue, in-flight transfer, cache, remote metadata, or health checks indicate uncertainty. Remote size checks are **not** cryptographic proof of write durability.
-- **Extra rclone controls:** refresh cloud directory cache and adjust live bandwidth limits.
+- **Extra rclone controls:** refresh cloud directory cache and adjust live bandwidth limits in **Transfers → Transfer bandwidth**. Select a preset and click **Apply limit** after the drive is mounted. Upload and download presets are independent and are not persisted between mounts.
 - **Mount protection:** prevent multiple NimboMount GUI instances and duplicate NimboMount-owned mounts; do not indiscriminately kill unrelated rclone processes.
 - **Outage handling and diagnostics:** capture sanitized rclone errors, display connection failures, and keep write cache available for recovery.
 
@@ -48,7 +48,7 @@ powershell -ExecutionPolicy Bypass -File .\packaging\windows\build.ps1
 If successful, the installer is generated at:
 
 ```text
-dist\installers\NimboMount-0.8.0-windows-x64-setup.exe
+dist\installers\NimboMount-0.8.5-windows-x64-setup.exe
 ```
 
 Alternatively, choose **Actions → Windows one-click installer → Run workflow** in GitHub. Download the built executable from that workflow's artifact after a successful run. The CI workflow builds on Windows and is **not** a substitute for testing the installed application.
@@ -80,6 +80,22 @@ Source-mode mounting additionally requires [rclone](https://rclone.org/downloads
 NimboMount uses rclone's VFS queue, stats, and control API to display transfers and gate normal unmounting. It uses `vfs/queue-set-expiry` to make eligible pending items retry sooner; it does **not** directly edit recovery cache files. A remote metadata match is an additional check, **not a guarantee of full remote durability**. Unobserved, concurrently modified, or externally opened files might not be individually verified.
 
 **If writes are pending or their state cannot be verified:** leave NimboMount running; do not uninstall it, delete its cache, or force-kill rclone. Failed entries no longer present in rclone's upload queue require separate recovery procedures. Power loss, forced termination, and OS shutdown can still interrupt writes.
+
+## v0.8.5 audit notes
+
+This release tightens type validation on persisted settings, rclone VFS statistics, transfer
+error counters, and mount-mode arguments. A malformed statistics response now prevents a
+normal unmount rather than allowing an uncertain write state. In direct-write mode (`off`),
+queued retry is explicitly unavailable and the transfer view reports this limitation.
+If a cache-mode remount fails, NimboMount attempts to restore the previous mode without
+removing the local recovery cache; an unsuccessful recovery is reported for manual action.
+
+**Important limitations:** In direct-write mode, rclone's idle transfer counters cannot
+prove that an application successfully wrote every byte, and cannot retry application
+write errors after the fact. Close files, check your source program's errors, and verify
+critical remote copies before unmounting. Switching modes closes/remounts the filesystem,
+so close open handles before using the checkbox. A full Windows/MEGA/WinFsp integration
+and crash-recovery test has **not** been completed.
 
 ## Project layout
 
@@ -134,3 +150,29 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup and contribution conventions. 
 ## Acknowledgments
 
 NimboMount integrates with independent projects [rclone](https://rclone.org/), [WinFsp](https://winfsp.dev/), [PySide6](https://doc.qt.io/qtforpython-6/), and [MEGA](https://mega.nz/). NimboMount is not an official MEGA or rclone product.
+
+### Bandwidth limits (v0.8.5)
+
+Open **Transfers** and choose independent **Upload** and **Download** caps, then click **Apply limit**. Limits take effect on the running rclone mount, without remounting. A cap of *Unlimited* is `off`. Rates are expressed in **bytes per second**, not bits. The limits apply only to the active mount and reset when its process restarts.
+
+### Troubleshooting MEGA quota and symlink messages
+
+- `symlinks not supported without the --links flag: /`: usually a nonfatal message. NimboMount does not enable link translation automatically because it changes how symbolic links are stored.
+- `Statfs failed: failed to get Mega Quota: unexpected end of JSON input`: rclone could not decode MEGA's quota response. It does **not** prove a failed 2FA login. Verify whether the drive can still list/read files, check MEGA's service status and network, and retry once connectivity recovers. The app preserves cached writes and your saved session. Some WinFsp quota/free-space displays may be affected even when directory listing works.
+- Avoid forced shutdown or deleting your rclone VFS cache if uploads remain pending.
+
+### v0.8.5: false active-transfer warning
+
+If unmounting in older versions displayed “Active-transfer statistics unavailable”,
+this may have been caused by a valid `core/stats` response omitting the
+optional `transferring` field while idle. v0.8.5 accepts that response while
+still refusing to unmount if queued writes, active uploads, cache errors, or
+malformed safety statistics are present. This is not a guarantee of remote
+byte-for-byte durability; keep independent backups of important files.
+
+
+## Changing local cache mode
+
+In **Drive → Preferences**, toggle **Enable local file caching**. If the drive is mounted, NimboMount verifies that uploads have finished and prompts to unmount/remount immediately. If pending uploads or errors exist, it refuses the switch and keeps the existing mount and recovery cache. rclone does **not** support safely changing VFS cache modes in-place or canceling all cached writes without potential data loss.
+
+Disabling caching uses `--vfs-cache-mode off`: uploads stream directly and failed uploads cannot be retried through the VFS queue; some Windows file operations may not work. This does not disable directory metadata caching or small in-memory buffers.

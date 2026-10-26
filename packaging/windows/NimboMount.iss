@@ -1,4 +1,4 @@
-#define AppVersion "0.8.0"
+#define AppVersion "0.8.5"
 [Setup]
 AppId={{3CD4D2ED-8DD3-4B1F-9EC8-99E47CF45538}
 AppName=NimboMount

@@ -66,12 +66,24 @@ class Settings:
     mountpoint: str = ""
     auto_reconnect: bool = True
     mount_at_login: bool = False
+    write_cache_enabled: bool = True
 
     @classmethod
     def load(cls):
         try:
             raw = json.loads(SETTINGS.read_text(encoding="utf-8"))
-            return cls(email=str(raw.get("email", "")), mountpoint=str(raw.get("mountpoint", "")), auto_reconnect=bool(raw.get("auto_reconnect", True)), mount_at_login=bool(raw.get("mount_at_login", False)))
+            if not isinstance(raw, dict):
+                return cls()
+            def boolean(name, default):
+                value = raw.get(name, default)
+                return value if isinstance(value, bool) else default
+            email = raw.get("email", "")
+            point = raw.get("mountpoint", "")
+            return cls(email=email if isinstance(email, str) else "",
+                       mountpoint=point if isinstance(point, str) else "",
+                       auto_reconnect=boolean("auto_reconnect", True),
+                       mount_at_login=boolean("mount_at_login", False),
+                       write_cache_enabled=boolean("write_cache_enabled", True))
         except (OSError, ValueError, TypeError):
             return cls()
 
@@ -157,6 +169,7 @@ class MountEngine:
         self._lock = threading.RLock()
         self.last_error = ""
         self.point = ""
+        self.write_cache_enabled = True
         self.rc_port = None
         self.rc_user = None
         self.rc_secret = None
@@ -250,7 +263,11 @@ class MountEngine:
             os.chmod(config, 0o600)
         return config
 
-    def mount(self, email: str, password: str, mountpoint: str, otp: str = "", force_login: bool = False) -> None:
+    def mount(self, email: str, password: str, mountpoint: str, otp: str = "", force_login: bool = False, write_cache_enabled: bool = True) -> None:
+        if not isinstance(write_cache_enabled, bool):
+            raise ValueError("Write cache mode must be enabled or disabled")
+        if not isinstance(email, str) or not isinstance(mountpoint, str):
+            raise ValueError("Email and mount target must be text")
         with self._lock:
             self.prerequisites()
             existing = nimbomount_rclone_processes(exclude_pid=self.proc.pid if self.proc else None)
@@ -306,7 +323,7 @@ class MountEngine:
             self._env["RCLONE_RC_PASS"] = self.rc_secret
             args = [self.binary, "--config", str(self._empty_mount_config()), "mount", REMOTE + ":", mountpoint,
                     "--rc", "--rc-addr", f"127.0.0.1:{self.rc_port}",
-                    "--vfs-cache-mode", "full", "--cache-dir", str(CACHE),
+                    "--vfs-cache-mode", "full" if write_cache_enabled else "off", "--cache-dir", str(CACHE),
                     "--vfs-write-back", "30s", "--vfs-cache-max-age", "87600h",
                     "--dir-cache-time", "2m", "--poll-interval", "0",
                     "--contimeout", "10s", "--timeout", "30s", "--retries", "3",
@@ -323,6 +340,7 @@ class MountEngine:
                 self._log_thread = threading.Thread(target=self._capture_errors, args=(proc,), daemon=True)
                 self._log_thread.start()
                 self.point = mountpoint
+                self.write_cache_enabled = write_cache_enabled
                 self._observed_writes = {}
                 self.last_error = ""
             except Exception:
@@ -351,7 +369,12 @@ class MountEngine:
     def diagnostics(self) -> str:
         with self._log_lock:
             lines = list(self._logs)
-        return "\n".join(lines[-40:]) or "No rclone error output was captured. Check WinFsp installation and drive letter."
+        excerpt = "\n".join(lines[-40:]) or "No rclone error output was captured. Check WinFsp installation and drive letter."
+        if "symlinks not supported without the --links flag" in excerpt:
+            excerpt += "\nHint: rclone does not expose symlinks by default. This warning alone may not prevent mounting. Enabling --vfs-links changes how symlinks are represented; do not enable automatically."
+        if "failed to get Mega Quota" in excerpt or "unexpected end of JSON input" in excerpt:
+            excerpt += "\nHint: MEGA returned an invalid/incomplete API response. Check MEGA availability and connectivity, then retry later; this is not necessarily a 2FA failure. NimboMount will not delete the cached writes or invalidate your saved session."
+        return excerpt
 
     def exit_diagnostic(self) -> str:
         proc = self.proc
@@ -410,13 +433,20 @@ class MountEngine:
 
     def transfer_snapshot(self) -> dict:
         """Read all VFS durability counters; never default a missing counter to zero."""
+        if not self.write_cache_enabled:
+            # With VFS caching off, the VFS upload queue doesn't exist.
+            # rclone cannot retry a failed direct write; never pretend it can.
+            stats = self.rc("core/stats")
+            if not isinstance(stats, dict):
+                raise RuntimeError("Direct-transfer statistics unavailable")
+            return {"queue": [], "cache": None, "stats": stats, "direct": True, "collected": time.time()}
         queue_payload = self.rc("vfs/queue")
         vfs_payload = self.rc("vfs/stats")
         stats = self.rc("core/stats")
         queue = queue_payload.get("queue")
         cache = vfs_payload.get("diskCache")
-        if not isinstance(queue, list) or not isinstance(cache, dict):
-            raise RuntimeError("rclone did not return VFS queue and disk-cache statistics")
+        if not isinstance(queue, list) or not isinstance(cache, dict) or not isinstance(stats, dict):
+            raise RuntimeError("rclone did not return valid VFS queue, disk-cache and transfer statistics")
         required = ("uploadsQueued", "uploadsInProgress", "erroredFiles", "outOfSpace")
         if any(key not in cache for key in required):
             raise RuntimeError("rclone did not return all required write safety counters")
@@ -435,6 +465,20 @@ class MountEngine:
     @staticmethod
     def _write_state(snapshot: dict) -> tuple[bool, str]:
         """Fail closed for every unknown, busy or errored cache state."""
+        if snapshot.get("direct"):
+            stats = snapshot.get("stats")
+            if not isinstance(stats, dict):
+                return False, "Direct transfer status unavailable"
+            if not isinstance(stats.get("transferring", []), list):
+                return False, "Malformed direct transfer status"
+            if stats.get("transferring", []):
+                return False, "Direct uploads/downloads are active"
+            errors = stats.get("errors", 0)
+            if isinstance(errors, bool) or not isinstance(errors, int) or errors < 0:
+                return False, "Direct transfer error counter is malformed"
+            if errors:
+                return False, "Direct transfers report errors"
+            return True, "No active direct transfers reported (not a remote durability guarantee)"
         cache = snapshot.get("cache")
         queue = snapshot.get("queue")
         if not isinstance(cache, dict) or not isinstance(queue, list):
@@ -442,6 +486,12 @@ class MountEngine:
         for key in ("uploadsQueued", "uploadsInProgress", "erroredFiles", "outOfSpace"):
             if key not in cache:
                 return False, f"Missing rclone VFS counter: {key}"
+        for counter in ("uploadsQueued", "uploadsInProgress", "erroredFiles"):
+            value = cache[counter]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return False, f"Malformed VFS cache counter: {counter}"
+        if not isinstance(cache["outOfSpace"], bool):
+            return False, "Malformed VFS cache disk-space flag"
         if cache["outOfSpace"]:
             return False, "VFS cache reports insufficient disk space"
         if cache["erroredFiles"]:
@@ -450,11 +500,20 @@ class MountEngine:
             return False, (f"Uploads pending: {len(queue)} visible, "
                            f"{cache['uploadsQueued']} queued, {cache['uploadsInProgress']} active")
         stats = snapshot.get("stats")
-        if not isinstance(stats, dict) or not isinstance(stats.get("transferring"), list):
+        if not isinstance(stats, dict):
             return False, "Active-transfer statistics unavailable"
-        if stats["transferring"]:
+        # rclone omits the `transferring` field when no active transfers
+        # have been recorded. An absent field is not a failed stats call.
+        # A present but malformed field remains a safety failure.
+        transferring = stats.get("transferring", [])
+        if not isinstance(transferring, list):
+            return False, "Malformed active-transfer statistics"
+        if transferring:
             return False, "Transfers are still active"
-        if stats.get("errors", 0):
+        errors = stats.get("errors", 0)
+        if isinstance(errors, bool) or not isinstance(errors, int) or errors < 0:
+            return False, "Malformed rclone error counter"
+        if errors:
             return False, "rclone transfer statistics report errors"
         return True, "VFS cache is idle and reports no pending or errored writes"
 
@@ -462,8 +521,11 @@ class MountEngine:
         """Prioritize a real queued write; never rewrite/remove cache files."""
         if isinstance(item_id, bool) or not isinstance(item_id, int):
             raise ValueError("Select a valid upload")
-        queue = self.transfer_snapshot()["queue"]
-        item = next((x for x in queue if x.get("id") == item_id), None)
+        snapshot = self.transfer_snapshot()
+        if snapshot.get("direct"):
+            raise RuntimeError("Queued upload retry is unavailable with caching disabled")
+        queue = snapshot["queue"]
+        item = next((x for x in queue if isinstance(x, dict) and x.get("id") == item_id), None)
         if item is None:
             raise RuntimeError("Upload no longer exists in the queue; refresh transfers")
         if item.get("uploading"):
@@ -472,8 +534,11 @@ class MountEngine:
 
     def retry_all_queued(self) -> int:
         """Move pending and retrying writes to the front of rclone's VFS queue."""
-        queue = self.transfer_snapshot()["queue"]
-        ids = [x["id"] for x in queue
+        snapshot = self.transfer_snapshot()
+        if snapshot.get("direct"):
+            raise RuntimeError("Queued upload retry is unavailable with caching disabled")
+        queue = snapshot["queue"]
+        ids = [x["id"] for x in queue if isinstance(x, dict)
                if isinstance(x.get("id"), int) and not isinstance(x.get("id"), bool)
                and not x.get("uploading")]
         for item_id in ids:
@@ -484,9 +549,16 @@ class MountEngine:
         """Invalidate and reload the mounted root's directory cache."""
         self.rc("vfs/refresh", {"dir": "", "recursive": False})
 
+    def set_bandwidth_limits(self, upload: str, download: str) -> dict:
+        """Apply independent upload/download caps on this mounted rclone process."""
+        supported = {"off", "512k", "1M", "5M", "10M", "25M", "50M"}
+        if upload not in supported or download not in supported:
+            raise ValueError("Unsupported speed limit")
+        return self.rc("core/bwlimit", {"rate": f"{upload}:{download}"})
+
     def set_bandwidth_limit(self, rate: str) -> dict:
-        """Set transfer speed on the owned mount, not globally on the computer."""
-        if rate not in ("off", "512k", "1M", "5M", "10M", "25M", "50M"):
+        """Backward-compatible shared cap used by older integrations."""
+        if rate not in {"off", "512k", "1M", "5M", "10M", "25M", "50M"}:
             raise ValueError("Unsupported speed limit")
         return self.rc("core/bwlimit", {"rate": rate})
 
@@ -512,8 +584,10 @@ class MountEngine:
 
         Conservative, best-effort safety gate; not a proof of physical durability.
         """
-        if checks < 2:
-            raise ValueError("At least two independent checks required")
+        if isinstance(checks, bool) or not isinstance(checks, int) or checks < 2 or checks > 30:
+            raise ValueError("checks must be an integer between 2 and 30")
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 0 <= interval <= 60:
+            raise ValueError("interval must be between 0 and 60 seconds")
         for i in range(checks):
             try:
                 snapshot = self.transfer_snapshot()
@@ -524,9 +598,14 @@ class MountEngine:
                 raise RuntimeError("Cannot safely unmount: " + reason + ". Mount and cache retained.")
             if i < checks - 1:
                 time.sleep(interval)
-        self._verify_observed_remote()
+        if self.write_cache_enabled:
+            self._verify_observed_remote()
         # Race reduction: check state again after remote metadata requests.
-        good, reason = self._write_state(self.transfer_snapshot())
+        try:
+            final_snapshot = self.transfer_snapshot()
+        except Exception as exc:
+            raise RuntimeError("Cannot safely unmount: final write state unavailable; mount retained") from exc
+        good, reason = self._write_state(final_snapshot)
         if not good:
             raise RuntimeError("Unmount interrupted by new writes: " + reason)
 

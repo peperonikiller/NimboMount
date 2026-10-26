@@ -157,6 +157,14 @@ class MainWindow(QMainWindow):
         self.reconnect = QCheckBox("Automatically reconnect after failed mount")
         self.reconnect.setChecked(self.settings.auto_reconnect)
         options_layout.addWidget(self.reconnect)
+        self.write_cache_checkbox = QCheckBox("Enable local file caching (recommended)")
+        self.write_cache_checkbox.setChecked(self.settings.write_cache_enabled)
+        self.write_cache_checkbox.setToolTip("Enabled: offline staging and retryable uploads. Disabled: direct remote writes; failed uploads cannot be retried.")
+        self.write_cache_checkbox.toggled.connect(self.change_cache_mode)
+        options_layout.addWidget(self.write_cache_checkbox)
+        self.cache_mode_notice = QLabel("Cache mode changes remount the drive and may interrupt open files.")
+        self.cache_mode_notice.setWordWrap(True)
+        options_layout.addWidget(self.cache_mode_notice)
         self.startup = QCheckBox("Launch and mount automatically at login (requires saved MEGA session)")
         self.startup.setChecked(self.settings.mount_at_login)
         self.startup.toggled.connect(self.configure_startup)
@@ -208,6 +216,34 @@ class MainWindow(QMainWindow):
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#9ba6b4; font-size: 11px")
         transfers_layout.addWidget(tip)
+        bandwidth_group = QGroupBox("Transfer bandwidth")
+        bandwidth_layout = QHBoxLayout(bandwidth_group)
+        speed_choices = (
+            ("Unlimited", "off"), ("512 KiB/s", "512k"),
+            ("1 MiB/s", "1M"), ("5 MiB/s", "5M"),
+            ("10 MiB/s", "10M"), ("25 MiB/s", "25M"), ("50 MiB/s", "50M"),
+        )
+        bandwidth_layout.addWidget(QLabel("Upload"))
+        self.upload_limit_combo = QComboBox()
+        self.upload_limit_combo.setObjectName("upload_limit")
+        bandwidth_layout.addWidget(self.upload_limit_combo, 1)
+        bandwidth_layout.addWidget(QLabel("Download"))
+        self.download_limit_combo = QComboBox()
+        self.download_limit_combo.setObjectName("download_limit")
+        bandwidth_layout.addWidget(self.download_limit_combo, 1)
+        for label, rate in speed_choices:
+            self.upload_limit_combo.addItem(label, rate)
+            self.download_limit_combo.addItem(label, rate)
+        self.upload_limit_combo.setEnabled(False)
+        self.download_limit_combo.setEnabled(False)
+        self.bandwidth_apply = QPushButton("Apply limit")
+        self.bandwidth_apply.setEnabled(False)
+        self.bandwidth_apply.clicked.connect(self.apply_bandwidth_limit)
+        bandwidth_layout.addWidget(self.bandwidth_apply)
+        transfers_layout.addWidget(bandwidth_group)
+        self.bandwidth_status = QLabel("Mount a drive to adjust transfer bandwidth.")
+        self.bandwidth_status.setWordWrap(True)
+        transfers_layout.addWidget(self.bandwidth_status)
         transfers_layout.addWidget(QLabel("Upload activity"))
         self.queue_table = QTableWidget(0, 5)
         self.queue_table.setAlternatingRowColors(True)
@@ -379,7 +415,7 @@ class MainWindow(QMainWindow):
         if get_session(email) and not self.force_login.isChecked():
             self.manual_disconnect = False
             self._set_status("● Connecting…", "Restoring the saved MEGA session", "#ffd074")
-            self._worker("mount", lambda: self.engine.mount(email, "", point))
+            self._worker("mount", lambda: self.engine.mount(email, "", point, write_cache_enabled=self.settings.write_cache_enabled))
             return
         if not password:
             QMessageBox.warning(self, APP, "Enter your MEGA password to continue.")
@@ -402,6 +438,7 @@ class MainWindow(QMainWindow):
         self.settings.email = email
         self.settings.mountpoint = point
         self.settings.auto_reconnect = self.reconnect.isChecked()
+        self.settings.write_cache_enabled = self.write_cache_checkbox.isChecked()
         self.settings.mount_at_login = self.startup.isChecked()
         self.settings.save()
 
@@ -417,6 +454,66 @@ class MainWindow(QMainWindow):
         self.otp.clear()
         self._set_status("● Signing in…", "Verifying MEGA credentials before mounting", "#ffd074")
         self._worker("auth", lambda: self.engine.validate(email, password, otp))
+
+    def _restore_cache_checkbox(self):
+        self.write_cache_checkbox.blockSignals(True)
+        self.write_cache_checkbox.setChecked(self.settings.write_cache_enabled)
+        self.write_cache_checkbox.blockSignals(False)
+
+    def change_cache_mode(self, enabled):
+        """Switch modes by a verified safe unmount and remount, never in-place."""
+        if self.busy:
+            self._restore_cache_checkbox()
+            return
+        if not self.engine.alive():
+            self.settings.write_cache_enabled = enabled
+            self.settings.save()
+            self.cache_mode_notice.setText("Preference saved. Next mount will use " + ("local caching." if enabled else "direct writes (no offline recovery)."))
+            return
+        try:
+            snapshot = self.engine.transfer_snapshot()
+            safe, reason = self.engine._write_state(snapshot)
+        except Exception as exc:
+            self._restore_cache_checkbox()
+            QMessageBox.warning(self, APP, "Unable to verify uploads. Cache mode unchanged: " + str(exc))
+            return
+        if not safe:
+            self._restore_cache_checkbox()
+            QMessageBox.warning(self, APP,
+                "Uploads are pending or the write state is unsafe: " + reason +
+                "\n\nNimboMount cannot safely cancel cached uploads and switch modes immediately. "
+                "Canceling these writes can lose files. Retry after transfers finish; the existing cache and mount are preserved.")
+            return
+        choice = QMessageBox.question(self, APP,
+            "Switch cache mode now? NimboMount must unmount and remount the drive. "
+            "Close any open files first. With caching disabled, failed direct writes cannot be retried.")
+        if choice != QMessageBox.StandardButton.Yes:
+            self._restore_cache_checkbox()
+            return
+        email = self.settings.email or self.email.text().strip()
+        point = self.engine.point
+        self.manual_disconnect = True
+        self._set_status("● Switching cache mode…", "Verifying writes and remounting", "#ffd074")
+        old_mode = self.engine.write_cache_enabled
+        def switch():
+            self.engine.stop()  # performs a SECOND write-state check just before termination
+            try:
+                self.engine.mount(email, "", point, write_cache_enabled=enabled)
+            except Exception as new_error:
+                # Best-effort rollback of the original mode; never delete cached writes.
+                # If the new process started, DO NOT attempt a second mount.
+                if self.engine.alive():
+                    raise RuntimeError("New cache-mode mount started but readiness is uncertain; "
+                                       "inspect Diagnostics before trying again") from new_error
+                try:
+                    self.engine.mount(email, "", point, write_cache_enabled=old_mode)
+                except Exception as rollback_error:
+                    raise RuntimeError("Cache-mode change failed; restoring previous mount also failed: "
+                                       + str(rollback_error)) from new_error
+                raise RuntimeError("Cache-mode change failed; previous mount mode was restarted. "
+                                   "Wait for the drive to become available before trying again") from new_error
+        self._cache_switch_requested = enabled
+        self._worker("cache_switch", switch)
 
     def disconnect(self):
         if self.busy:
@@ -440,7 +537,7 @@ class MainWindow(QMainWindow):
                 self.force_login.setChecked(False)
                 self.manual_disconnect = False
                 self._set_status("● Authenticated", "MEGA login verified. Mounting the drive…", "#83dfab")
-                self._worker("mount", lambda: self.engine.mount(email, "", point))
+                self._worker("mount", lambda: self.engine.mount(email, "", point, write_cache_enabled=self.settings.write_cache_enabled))
             else:
                 self._set_status("● Login failed", message, "#ff8181")
                 self.diagnostics_view.setPlainText(message)
@@ -466,6 +563,35 @@ class MainWindow(QMainWindow):
                 # Do not automatically retry authentication errors.
                 if self.reconnect.isChecked() and any(x in message.lower() for x in ("network", "unreachable", "timeout")):
                     self.next_retry = time.monotonic() + 15
+        elif op == "cache_switch":
+            if ok:
+                self.settings.write_cache_enabled = self._cache_switch_requested
+                self.settings.save()
+                self.manual_disconnect = False
+                self.connected_once = False
+                self.mount_started_at = time.monotonic()
+                self.mount_probe_active = False
+                self._set_status("● Mount starting…", "Cache mode changed; waiting for drive registration", "#ffd074")
+                self.cache_mode_notice.setText("Active cache mode: " + ("Enabled" if self.settings.write_cache_enabled else "Disabled"))
+            else:
+                self._restore_cache_checkbox()
+                self.connected_once = False
+                if self.engine.alive():
+                    self.mount_started_at = time.monotonic()
+                    self.mount_probe_active = False
+                    self._set_status("● Mount starting…", "Cache change failed; verifying restored mount", "#ffd074")
+                else:
+                    self.mount_started_at = 0
+                    self._set_status("● Cache change failed", message, "#ff8181")
+                QMessageBox.warning(self, APP, "Cache switch failed. " + message + "\nAny existing recovery cache was not deleted.")
+        elif op == "bandwidth":
+            if ok:
+                self.bandwidth_status.setText(
+                    "Limits applied — Upload: " + self.upload_limit_combo.currentText() + "; Download: " + self.download_limit_combo.currentText()
+                )
+            else:
+                self.bandwidth_status.setText("Bandwidth change failed: " + message[:220])
+                QMessageBox.warning(self, APP, "Unable to change bandwidth limit: " + message)
         elif op == "retry_upload":
             if ok:
                 self.transfer_summary.setText("Retry requested. rclone will upload the selected queued file as soon as a slot is available.")
@@ -554,6 +680,8 @@ class MainWindow(QMainWindow):
             self.engine.cleanup()
             self.mount_started_at = 0
             self._set_status("● Mount process exited", error, "#ff8181")
+            self.connected_once = False
+            self._controls()
             self.tabs.setCurrentIndex(2)
             self.diagnostics_view.setPlainText(error)
             if not self.manual_disconnect and self.reconnect.isChecked():
@@ -600,8 +728,19 @@ class MainWindow(QMainWindow):
 
     def _retry_selection_changed(self):
         row = self.queue_table.currentRow()
-        self.retry_button.setEnabled(self.engine.alive() and not self.busy and
-                                     0 <= row < len(self.queue_ids) and self.queue_ids[row] is not None)
+        self.retry_button.setEnabled(self.engine.alive() and self.engine.write_cache_enabled
+                                     and not self.busy and 0 <= row < len(self.queue_ids)
+                                     and self.queue_ids[row] is not None)
+
+    def apply_bandwidth_limit(self):
+        if self.busy or not self.engine.alive() or not self.connected_once:
+            self.bandwidth_status.setText("Wait for the drive to finish mounting before changing bandwidth.")
+            return
+        upload_rate = self.upload_limit_combo.currentData()
+        download_rate = self.download_limit_combo.currentData()
+        self.bandwidth_apply.setEnabled(False)
+        self.bandwidth_status.setText("Applying bandwidth limit…")
+        self._worker("bandwidth", lambda: self.engine.set_bandwidth_limits(upload_rate, download_rate))
 
     def retry_selected_upload(self):
         row = self.queue_table.currentRow()
@@ -609,6 +748,9 @@ class MainWindow(QMainWindow):
             return
         item_id = self.queue_ids[row]
         if item_id is None:
+            return
+        if not self.engine.write_cache_enabled:
+            QMessageBox.information(self, APP, "Direct-write mode has no upload queue. Retry from the application that wrote the file.")
             return
         self.retry_button.setEnabled(False)
         self._worker("retry_upload", lambda: self.engine.retry_upload(item_id))
@@ -625,21 +767,42 @@ class MainWindow(QMainWindow):
         if error:
             self.transfer_summary.setText("Transfer monitoring temporarily unavailable: " + error[:140])
             return
+        if data.get("direct"):
+            stats = data.get("stats") or {}
+            transferring = stats.get("transferring") or []
+            self.queue_ids = []
+            self.queue_table.setRowCount(0)
+            self._retry_selection_changed()
+            self.transfer_summary.setText(
+                "Direct-write mode: no local VFS upload queue or failed-write retry. "
+                f"Active transfers: {len(transferring)} | Reported errors: {stats.get('errors', 'unknown')}. "
+                "A failed direct upload must be restarted by the application writing the file."
+            )
+            return
         queue = data.get("queue") or []
         cache = data.get("cache") or {}
         stats = data.get("stats") or {}
-        self.queue_ids = [item.get("id") if isinstance(item.get("id"), int) else None for item in queue]
+        if not isinstance(queue, list) or not all(isinstance(item, dict) for item in queue):
+            self.transfer_summary.setText("Malformed transfer queue response. Check Diagnostics; no retry requested.")
+            self.queue_ids = []
+            self.queue_table.setRowCount(0)
+            return
+        self.queue_ids = [item.get("id") if isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool) else None for item in queue]
         self.queue_table.setRowCount(len(queue))
         # core/stats transfers names may reflect backend internal names, not exactly VFS path.
         running = stats.get("transferring") or []
+        if not isinstance(running, list):
+            running = []
         for i, entry in enumerate(queue):
             name = str(entry.get("name", ""))
-            transfer = next((t for t in running if t.get("name") == name or
-                             str(t.get("name", "")).endswith("/" + name)), None)
+            transfer = next((t for t in running if isinstance(t, dict) and
+                             (t.get("name") == name or str(t.get("name", "")).endswith("/" + name))), None)
             pct = "—"
-            if transfer and transfer.get("size"):
-                pct = f"{100 * transfer.get('bytes', 0) / transfer['size']:.1f}%"
-            tries = int(entry.get("tries", 0))
+            if transfer and isinstance(transfer.get("size"), (int, float)) and transfer["size"] > 0 \
+                    and isinstance(transfer.get("bytes", 0), (int, float)):
+                pct = f"{min(100, max(0, 100 * transfer.get('bytes', 0) / transfer['size'])):.1f}%"
+            raw_tries = entry.get("tries", 0)
+            tries = raw_tries if isinstance(raw_tries, int) and not isinstance(raw_tries, bool) and raw_tries >= 0 else 0
             state = "Uploading" if entry.get("uploading") else ("Retrying" if tries else "Queued")
             cells = [name, self._human_bytes(entry.get("size", 0)), state, str(tries), pct]
             for j, value in enumerate(cells):
@@ -678,6 +841,11 @@ class MainWindow(QMainWindow):
 
     def _controls(self):
         active = self.engine.alive()
+        bandwidth_ready = active and self.connected_once and not self.busy
+        self.upload_limit_combo.setEnabled(bandwidth_ready)
+        self.download_limit_combo.setEnabled(bandwidth_ready)
+        self.bandwidth_apply.setEnabled(bandwidth_ready)
+        self.write_cache_checkbox.setEnabled(not self.busy)
         self.connect_btn.setText("Verify & Mount" if self.auth_stage else "Continue to sign in / Connect")
         self.connect_btn.setEnabled(not self.busy and not active)
         self.back_btn.setEnabled(not self.busy)
