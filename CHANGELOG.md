@@ -1,4 +1,6 @@
 ## 0.8.5 — Safety and validation audit (development)
+- Faster MEGA reads on the next mount: 8 file-transfer slots, a 32 MiB buffer, and, with local caching on, four parallel 8 MiB download streams plus 128 MiB of read-ahead. Remount to apply. A Transfers bandwidth cap still overrides this. One large upload stays a single MEGA stream. Needs rclone with `--vfs-read-chunk-streams` (the Windows build ships 1.75.2).
+- Uploads start 5 seconds after a file goes idle, instead of 30 seconds. Up to 8 files upload at once. rclone still sends each file on one connection.
 - Validate saved boolean settings and mount-mode parameters instead of coercing values.
 - Fail closed on invalid VFS upload counters, disk-space flags, missing transfer stats, and malformed error totals.
 - Direct-write mode explicitly rejects queued retry operations and reports its limitations.

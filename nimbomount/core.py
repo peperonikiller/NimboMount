@@ -161,6 +161,34 @@ def nimbomount_rclone_processes(exclude_pid: int | None = None) -> list[dict]:
             continue
     return found
 
+
+def throughput_mount_args(write_cache_enabled: bool) -> list[str]:
+    """rclone flags that raise transfer throughput on a single MEGA mount.
+
+    MEGA downloads one open file as a sequence of chunks on one connection.
+    Four range streams overlap those chunks so a large read can use more of
+    the link. Read-ahead is disk-backed and only applies to
+    ``--vfs-cache-mode full``. Direct-write mounts keep the transfer-slot
+    and memory-buffer changes only. Stream count stays at four because MEGA
+    temporarily blocks accounts that open too many API sessions.
+
+    MEGA uploads are also one connection per file in rclone, so a single
+    file cannot be split across streams. ``--transfers`` uploads up to
+    eight files at once, and ``--vfs-write-back 5s`` starts each upload
+    five seconds after the file goes idle instead of waiting 30 seconds.
+    """
+    if not isinstance(write_cache_enabled, bool):
+        raise ValueError("Write cache mode must be enabled or disabled")
+    args = ["--transfers", "8", "--buffer-size", "32M", "--vfs-write-back", "5s"]
+    if write_cache_enabled:
+        args += [
+            "--vfs-read-ahead", "128M",
+            "--vfs-read-chunk-size", "8M",
+            "--vfs-read-chunk-streams", "4",
+        ]
+    return args
+
+
 class MountEngine:
     def __init__(self):
         self.binary = _find_rclone()
@@ -309,6 +337,8 @@ class MountEngine:
             self._env.update({"RCLONE_CONFIG_NIMBO_MEGA_TYPE": "mega",
                               "RCLONE_CONFIG_NIMBO_MEGA_USER": email,
                               "RCLONE_CONFIG_NIMBO_MEGA_PASS": obscured.stdout.strip(),
+                              # MEGA's default is plain HTTP. Some ISPs throttle that
+                              # until transfers crawl. HTTPS avoids that throttle.
                               "RCLONE_CONFIG_NIMBO_MEGA_USE_HTTPS": "true"})
             self._env["RCLONE_CONFIG_NIMBO_MEGA_SESSION_ID"] = session["session_id"]
             self._env["RCLONE_CONFIG_NIMBO_MEGA_MASTER_KEY"] = session["master_key"]
@@ -324,10 +354,11 @@ class MountEngine:
             args = [self.binary, "--config", str(self._empty_mount_config()), "mount", REMOTE + ":", mountpoint,
                     "--rc", "--rc-addr", f"127.0.0.1:{self.rc_port}",
                     "--vfs-cache-mode", "full" if write_cache_enabled else "off", "--cache-dir", str(CACHE),
-                    "--vfs-write-back", "30s", "--vfs-cache-max-age", "87600h",
+                    "--vfs-cache-max-age", "87600h",
                     "--dir-cache-time", "2m", "--poll-interval", "0",
                     "--contimeout", "10s", "--timeout", "30s", "--retries", "3",
-                    "--low-level-retries", "3", "--log-level", "ERROR"]
+                    "--low-level-retries", "3", "--log-level", "ERROR",
+                    *throughput_mount_args(write_cache_enabled)]
             if IS_WIN:
                 args += ["--volname", "NimboMount MEGA"]
             try:

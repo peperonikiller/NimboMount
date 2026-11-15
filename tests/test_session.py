@@ -46,6 +46,9 @@ class SessionTests(unittest.TestCase):
             engine.mount('me@example.org', '', 'M:')
             self.assertEqual(engine._env['RCLONE_CONFIG_NIMBO_MEGA_SESSION_ID'], 'id')
             self.assertNotIn('RCLONE_CONFIG_NIMBO_MEGA_2FA', engine._env)
+            argv = core.subprocess.Popen.call_args.args[0]
+            self.assertEqual(argv[argv.index('--vfs-read-chunk-streams') + 1], '4')
+            self.assertEqual(argv[argv.index('--transfers') + 1], '8')
 
 if __name__ == '__main__':
     unittest.main()

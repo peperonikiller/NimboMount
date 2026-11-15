@@ -155,6 +155,8 @@ NimboMount integrates with independent projects [rclone](https://rclone.org/), [
 
 Open **Transfers** and choose independent **Upload** and **Download** caps, then click **Apply limit**. Limits take effect on the running rclone mount, without remounting. A cap of *Unlimited* is `off`. Rates are expressed in **bytes per second**, not bits. The limits apply only to the active mount and reset when its process restarts.
 
+New mounts also ask rclone for more throughput before any cap is applied. MEGA's own client sends each file as one chunk stream, and plain HTTP on that stream is what some ISPs throttle. NimboMount keeps HTTPS on, allows 8 files at once, uses a 32 MiB read buffer, and, when local caching is enabled, reads a file as four 8 MiB streams with 128 MiB of read-ahead. Uploads use those same 8 slots and start 5 seconds after a file stops changing, instead of waiting 30 seconds. A single upload is still one MEGA stream, because rclone sends that file's chunks one after another, so one large file will not use all 8 slots. Disconnect and connect again after upgrading to pick this up. The four-stream download cap is deliberate: MEGA can temporarily block accounts that open too many sessions.
+
 ### Troubleshooting MEGA quota and symlink messages
 
 - `symlinks not supported without the --links flag: /`: usually a nonfatal message. NimboMount does not enable link translation automatically because it changes how symbolic links are stored.
